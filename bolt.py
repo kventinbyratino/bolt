@@ -265,7 +265,17 @@ _bi.__import__ = _restricted_import
 def _blocked(*a, **kw):
     raise PermissionError("Операция запрещена sandbox")
 
-_bi.eval = _blocked
+_orig_eval = _bi.eval
+
+def _restricted_eval(*args, **kwargs):
+    frame = _sys._getframe(1)
+    caller_globals = frame.f_globals if frame else {}
+    caller_name = caller_globals.get("__package__") or caller_globals.get("__name__") or ""
+    if caller_name and caller_name != "__main__":
+        return _orig_eval(*args, **kwargs)
+    raise PermissionError("Операция запрещена sandbox")
+
+_bi.eval = _restricted_eval
 """
 
 
