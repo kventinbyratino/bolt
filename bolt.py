@@ -108,6 +108,19 @@ cq.exporters.export(result, "output.stp")
 - Скругления и фаски применяй после выбора рёбер: `.edges("|Z").fillet(2)` или `.edges(">Z").chamfer(1)`.
 - Экспорт STEP: строго `cq.exporters.export(result, "output.stp")`.
 
+Резьба в CadQuery 2.8.0:
+- Если пользователь просит резьбу, сначала выбери инженерно безопасный вариант:
+  1) для простых/быстрых моделей допускается условная резьба: цилиндр + фаска + поясняющий комментарий;
+  2) для видимой геометрической резьбы строй винтовую линию `.parametricCurve(...)` и протягивай по ней профиль через `.sweep(path, isFrenet=True)`.
+- Наружная резьба: создай основной цилиндр по наружному диаметру, затем добавь винтовой гребень треугольного/трапецеидального профиля вокруг оси Z через `.sweep(...)` и объедини с цилиндром.
+- Внутренняя резьба: создай отверстие по внутреннему диаметру, затем вырежи винтовую канавку профилем через `.cut(...)`; если это слишком сложно или рискованно, делай условную внутреннюю резьбу как отверстие с фасками и комментариями.
+- Основные параметры резьбы задавай явно: `major_diameter`, `minor_diameter`, `pitch`, `thread_length`, `turns = thread_length / pitch`, `thread_depth`.
+- Для метрической резьбы используй разумные приближения: глубина профиля около `0.613 * pitch`, внутренний диаметр около `major_diameter - 1.226 * pitch`.
+- Для винтовой линии вокруг оси Z используй параметризацию: `angle = 2 * math.pi * turns * t`, `x = radius * math.cos(angle)`, `y = radius * math.sin(angle)`, `z = thread_length * t`.
+- Не импортируй специальные модули для резьбы. Разрешены только `cadquery as cq` и `math`.
+- Не делай слишком мелкую/длинную детальную резьбу без необходимости: она может быть тяжёлой для OpenCascade. Для длинных деталей предпочитай условную резьбу или укрупнённый шаг.
+- Обязательно добавляй заходные фаски на резьбовых торцах, чтобы STEP был технологичнее и устойчивее.
+
 Практические правила моделирования:
 - Всегда задавай размеры через именованные переменные: `length`, `width`, `height`, `wall`, `radius`, `hole_diameter`.
 - Строй модель последовательно: базовое тело → вырезы → отверстия → фаски/скругления → экспорт.
@@ -276,8 +289,11 @@ def check_ast(code: str) -> tuple[bool, str]:
 SANDBOX_PREAMBLE = """
 import sys as _sys
 import builtins as _bi
+import os as _os
 
 _ALLOWED_ROOTS = {"cadquery", "math"}
+_SANDBOX_CWD = _os.path.abspath(_os.getcwd())
+_ALLOWED_OUTPUT = _os.path.abspath(_os.path.join(_SANDBOX_CWD, "output.stp"))
 _ALLOWED_INTERNALS = set(_sys.builtin_module_names) | {
     "_io", "io", "_frozen_importlib", "_frozen_importlib_external",
     "zipimport", "encodings", "codecs", "importlib", "marshal",
@@ -305,6 +321,29 @@ _bi.__import__ = _restricted_import
 
 def _blocked(*a, **kw):
     raise PermissionError("Операция запрещена sandbox")
+
+_orig_open = _bi.open
+
+def _restricted_open(file, mode="r", *args, **kwargs):
+    frame = _sys._getframe(1)
+    caller_globals = frame.f_globals if frame else {}
+    caller_name = caller_globals.get("__package__") or caller_globals.get("__name__") or ""
+
+    # Разрешаем файловые операции внутреннему коду зависимостей CadQuery/OCP:
+    # exporters CadQuery должны иметь возможность создать output.stp.
+    if caller_name and caller_name != "__main__":
+        return _orig_open(file, mode, *args, **kwargs)
+
+    path = _os.path.abspath(_os.fspath(file))
+    write_mode = any(flag in str(mode) for flag in ("w", "a", "x", "+"))
+    if write_mode and path == _ALLOWED_OUTPUT:
+        return _orig_open(file, mode, *args, **kwargs)
+
+    raise PermissionError(
+        "Файловые операции запрещены sandbox; разрешён только экспорт STEP в output.stp"
+    )
+
+_bi.open = _restricted_open
 
 _orig_eval = _bi.eval
 
