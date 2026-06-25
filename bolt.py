@@ -236,29 +236,36 @@ SANDBOX_PREAMBLE = """
 import sys as _sys
 import builtins as _bi
 
+_ALLOWED_ROOTS = {"cadquery", "math"}
+_ALLOWED_INTERNALS = set(_sys.builtin_module_names) | {
+    "_io", "io", "_frozen_importlib", "_frozen_importlib_external",
+    "zipimport", "encodings", "codecs", "importlib", "marshal",
+    "posix", "nt", "time", "_thread", "atexit"
+}
+
 _orig_import = _bi.__import__
 def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
     root = name.split(".")[0]
-    if root not in ("cadquery", "math"):
-        raise ImportError(f"Импорт {name} запрещён")
-    return _orig_import(name, globals, locals, fromlist, level)
+    caller_name = ""
+    if globals:
+        caller_name = globals.get("__package__") or globals.get("__name__") or ""
+    caller_root = caller_name.split(".")[0] if caller_name else ""
+
+    if root in _ALLOWED_ROOTS:
+        return _orig_import(name, globals, locals, fromlist, level)
+    if caller_root in _ALLOWED_ROOTS:
+        return _orig_import(name, globals, locals, fromlist, level)
+    if caller_name and caller_name != "__main__":
+        return _orig_import(name, globals, locals, fromlist, level)
+    if root in _ALLOWED_INTERNALS or root.startswith("_"):
+        return _orig_import(name, globals, locals, fromlist, level)
+    raise ImportError(f"Импорт {name} запрещён")
 _bi.__import__ = _restricted_import
 
 def _blocked(*a, **kw):
     raise PermissionError("Операция запрещена sandbox")
 
-_bi.exec = _blocked
 _bi.eval = _blocked
-_bi.compile = _blocked
-
-for _blocked_mod in (
-    "os", "sys", "subprocess", "socket", "urllib", "http", "requests",
-    "shutil", "ctypes", "multiprocessing", "threading", "pathlib", "tempfile", "json"
-):
-    class _Blocker:
-        def __getattr__(self, name):
-            raise PermissionError(f"Модуль {_blocked_mod} заблокирован")
-    _sys.modules[_blocked_mod] = _Blocker()
 """
 
 
