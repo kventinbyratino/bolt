@@ -395,6 +395,52 @@ def generate_cad_code(refined: dict[str, Any], run_dir: Path, model: str, attemp
     return raw, code
 
 
+def build_final_report(run_dir: Path, status: str, final_message: str) -> Path:
+    report_path = run_dir / "final_report.md"
+    sections = [
+        "# Итоговый отчёт запуска",
+        "",
+        f"- run_dir: `{run_dir}`",
+        f"- status: `{status}`",
+        f"- final_message: {final_message}",
+        "",
+        "## Артефакты",
+        "",
+    ]
+
+    artifact_paths = sorted(
+        path for path in run_dir.rglob("*")
+        if path.is_file() and path.name != report_path.name
+    )
+
+    for path in artifact_paths:
+        rel = path.relative_to(run_dir)
+        sections.append(f"- `{rel}` ({path.stat().st_size} bytes)")
+
+    sections.append("")
+    sections.append("## Логи и ошибки")
+    sections.append("")
+
+    for path in artifact_paths:
+        rel = path.relative_to(run_dir)
+        suffix = path.suffix.lower()
+        if suffix not in {".txt", ".log", ".json", ".py", ".md"}:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            content = f"<не удалось прочитать: {exc}>"
+        sections.append(f"### `{rel}`")
+        sections.append("")
+        sections.append("```")
+        sections.append(content.rstrip())
+        sections.append("```")
+        sections.append("")
+
+    safe_write_text(report_path, "\n".join(sections).rstrip() + "\n")
+    return report_path
+
+
 def print_refined_summary(source_request: str, refined: dict[str, Any]) -> None:
     print(f"\n🎯 Исходный запрос: {source_request}")
     print(f"🧭 Уточнённый запрос: {refined['refined_request']}")
@@ -466,6 +512,9 @@ def create_model(
 ) -> Path | None:
     run_dir = create_run_dir(description)
     run_handler = attach_run_logger(run_dir)
+    result_path: Path | None = None
+    final_status = "unknown"
+    final_message = "Запуск завершён без итогового статуса"
 
     try:
         logger.info("=" * 80)
@@ -488,6 +537,8 @@ def create_model(
             interactive=interactive,
         )
         if not confirmed_description or not confirmed_refined:
+            final_status = "cancelled"
+            final_message = "Запуск отменён пользователем после этапа уточнения"
             print("🛑 Запуск отменён пользователем")
             return None
 
@@ -501,6 +552,8 @@ def create_model(
 
             if not code:
                 logger.error("Пустой код от Ollama")
+                final_status = "failed"
+                final_message = "Пустой ответ от Ollama при генерации CadQuery-кода"
                 print("⚠️ Пустой ответ")
                 return None
 
@@ -524,6 +577,8 @@ def create_model(
 
                 refined["cad_prompt"] = f"{refined['cad_prompt']}\n\nИсправление после AST-ошибки:\n{repair_prompt}"
                 safe_write_json(run_dir / f"14_attempt_{attempt}_refined_after_ast.json", refined)
+                final_status = "retrying_after_ast_error"
+                final_message = reason
                 continue
 
             print("▶️ Запуск в sandbox...")
@@ -532,6 +587,9 @@ def create_model(
 
             if ok and path:
                 logger.info("Успешное завершение: %s", path)
+                final_status = "success"
+                final_message = out
+                result_path = path
                 print(out)
                 return path
 
@@ -544,19 +602,29 @@ def create_model(
                 "Исправь CadQuery-код, сохрани ту же цель модели и соблюди все ограничения."
             )
             safe_write_json(run_dir / f"16_attempt_{attempt}_refined_after_error.json", refined)
+            final_status = "retrying_after_sandbox_error"
+            final_message = out
 
         logger.error("Лимит попыток исчерпан")
+        final_status = "failed"
+        final_message = "Лимит попыток генерации исчерпан"
         print("🛑 Лимит попыток исчерпан")
         return None
 
     except Exception as exc:
         logger.exception("Критическая ошибка в create_model")
         safe_write_text(run_dir / "99_fatal_error.txt", traceback.format_exc())
+        final_status = "fatal_error"
+        final_message = f"Критическая ошибка: {exc}"
         print(f"💥 Ошибка: {exc}")
         return None
     finally:
         logging.getLogger("bolt").removeHandler(run_handler)
         run_handler.close()
+        report_path = build_final_report(run_dir, status=final_status, final_message=final_message)
+        print(f"📝 Итоговый отчёт: {report_path}")
+        if result_path:
+            logger.info("Финальный отчёт сохранён: %s", report_path)
 
 
 # ==================== CLI ====================
