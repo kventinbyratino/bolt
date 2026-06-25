@@ -42,7 +42,7 @@ RUNS_DIR.mkdir(exist_ok=True)
 
 
 # ==================== КОНФИГ ====================
-DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
+DEFAULT_OLLAMA_MODEL = "qwen3:4b"
 DEFAULT_REFINER_MODEL = DEFAULT_OLLAMA_MODEL
 MAX_RETRIES = 3
 TIMEOUT_SEC = 60
