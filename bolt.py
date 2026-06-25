@@ -365,7 +365,23 @@ def build_child_env() -> dict[str, str]:
         "PYTHONPATH": "",
     }
     if sys.platform == "win32":
-        for key in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"):
+        # Windows/Python dependencies may call Path.home()/expanduser().
+        # If USERPROFILE/HOME are stripped, pathlib raises:
+        # RuntimeError: Could not determine home directory.
+        for key in (
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+        ):
             if key in os.environ:
                 safe_env[key] = os.environ[key]
     return safe_env
