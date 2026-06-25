@@ -378,6 +378,67 @@ def generate_cad_code(refined: dict[str, Any], run_dir: Path, model: str, attemp
     return raw, code
 
 
+def print_refined_summary(source_request: str, refined: dict[str, Any]) -> None:
+    print(f"\n🎯 Исходный запрос: {source_request}")
+    print(f"🧭 Уточнённый запрос: {refined['refined_request']}")
+    assumptions = refined.get("assumptions") or []
+    if assumptions:
+        print("📌 Допущения:")
+        for item in assumptions:
+            print(f"   - {item}")
+
+
+def confirm_or_revise_refinement(
+    original_description: str,
+    refined: dict[str, Any],
+    run_dir: Path,
+    model: str,
+    interactive: bool,
+) -> tuple[str | None, dict[str, Any] | None]:
+    current_source = original_description
+    current_refined = refined
+    revision_index = 0
+
+    while True:
+        print_refined_summary(current_source, current_refined)
+        if not interactive:
+            logger.info("Подтверждение уточнённого запроса пропущено: неинтерактивный режим")
+            return current_source, current_refined
+
+        print("\nПодтвердите уточнение:")
+        print("  Enter / yes / y  — принять")
+        print("  edit             — скорректировать запрос")
+        print("  cancel           — отменить запуск")
+        answer = input("confirm> ").strip()
+        normalized = answer.lower()
+
+        if normalized in {"", "y", "yes", "да", "ок", "accept"}:
+            logger.info("Пользователь подтвердил уточнённый запрос")
+            safe_write_text(run_dir / "03_confirmation_status.txt", "accepted")
+            return current_source, current_refined
+
+        if normalized in {"cancel", "c", "n", "no", "нет", "отмена"}:
+            logger.info("Пользователь отменил запуск после уточнения")
+            safe_write_text(run_dir / "03_confirmation_status.txt", "cancelled")
+            return None, None
+
+        if normalized == "edit":
+            edited = input("Введите скорректированный запрос> ").strip()
+            if not edited:
+                print("⚠️ Пустая корректировка, оставляю текущий вариант.")
+                continue
+
+            revision_index += 1
+            current_source = edited
+            safe_write_text(run_dir / f"03_revision_{revision_index:02d}_user_request.txt", edited)
+            logger.info("Пользователь внёс корректировку #%s: %s", revision_index, edited)
+            current_refined = refine_request(edited, run_dir, model=model)
+            safe_write_json(run_dir / f"03_revision_{revision_index:02d}_refined_request.json", current_refined)
+            continue
+
+        print("⚠️ Не понял ответ. Используйте Enter/yes, edit или cancel.")
+
+
 # ==================== ЯДРО АГЕНТА ====================
 def create_model(
     description: str,
@@ -400,15 +461,21 @@ def create_model(
 
         safe_write_text(run_dir / "00_user_request.txt", description)
 
+        interactive = sys.stdin.isatty()
         refined = refine_request(description, run_dir, model=refiner_model)
+        confirmed_description, confirmed_refined = confirm_or_revise_refinement(
+            original_description=description,
+            refined=refined,
+            run_dir=run_dir,
+            model=refiner_model,
+            interactive=interactive,
+        )
+        if not confirmed_description or not confirmed_refined:
+            print("🛑 Запуск отменён пользователем")
+            return None
 
-        print(f"\n🎯 Исходный запрос: {description}")
-        print(f"🧭 Уточнённый запрос: {refined['refined_request']}")
-        assumptions = refined.get("assumptions") or []
-        if assumptions:
-            print("📌 Допущения:")
-            for item in assumptions:
-                print(f"   - {item}")
+        description = confirmed_description
+        refined = confirmed_refined
 
         for attempt in range(1, max_retries + 1):
             logger.info("Попытка генерации #%s", attempt)
