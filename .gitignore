@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+cad_output/
+sandbox_runs/
+*.log
