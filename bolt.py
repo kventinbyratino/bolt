@@ -69,7 +69,7 @@ REFINER_SYSTEM_PROMPT = """Ты — CAD-аналитик. Твоя задача:
    - порядок построения,
    - ключевые параметры,
    - что должно быть сохранено в переменную result,
-   - что нужен экспорт в output.stp.
+   - что нужен экспорт в output.step.
 7. Никаких markdown-блоков, только JSON.
 """
 
@@ -92,7 +92,7 @@ result = (
     .box(length, width, height)
 )
 
-cq.exporters.export(result, "output.stp")
+cq.exporters.export(result, "output.step")
 ```
 
 Ключевые возможности Workplane:
@@ -106,7 +106,7 @@ cq.exporters.export(result, "output.stp")
 - Массивы/паттерны: `.rarray(xSpacing, ySpacing, xCount, yCount)`, `.polarArray(radius, startAngle, angle, count)`, затем `.hole(...)` или `.eachpoint(...)`.
 - Размещение элементов: `.pushPoints([(x1, y1), (x2, y2)])` + операция, например `.hole(d)`.
 - Скругления и фаски применяй после выбора рёбер: `.edges("|Z").fillet(2)` или `.edges(">Z").chamfer(1)`.
-- Экспорт STEP: строго `cq.exporters.export(result, "output.stp")`.
+- Экспорт STEP: строго `cq.exporters.export(result, "output.step")`.
 
 Резьба в CadQuery 2.8.0:
 - Если пользователь просит резьбу, сначала выбери инженерно безопасный вариант:
@@ -135,10 +135,10 @@ cq.exporters.export(result, "output.stp")
 3. ЗАПРЕЩЕНО: import os, sys, subprocess, socket, urllib, requests, shutil, ctypes, pathlib, json, tempfile, threading, multiprocessing, builtins.
 4. ЗАПРЕЩЕНО: exec(), eval(), compile(), __import__().
 5. Финальную модель сохрани в переменную `result`.
-6. В конце ОБЯЗАТЕЛЬНО: cq.exporters.export(result, "output.stp")
+6. В конце ОБЯЗАТЕЛЬНО: cq.exporters.export(result, "output.step")
 7. Все размеры в миллиметрах. Параметрический подход.
 8. Комментарии на русском.
-9. Никаких show(), display(), сетевых вызовов, чтения/записи файлов кроме output.stp.
+9. Никаких show(), display(), сетевых вызовов, чтения/записи файлов кроме output.step.
 10. Если нужны константы — объяви их явно в коде.
 """
 
@@ -293,7 +293,7 @@ import os as _os
 
 _ALLOWED_ROOTS = {"cadquery", "math"}
 _SANDBOX_CWD = _os.path.abspath(_os.getcwd())
-_ALLOWED_OUTPUT = _os.path.abspath(_os.path.join(_SANDBOX_CWD, "output.stp"))
+_ALLOWED_OUTPUT = _os.path.abspath(_os.path.join(_SANDBOX_CWD, "output.step"))
 _ALLOWED_INTERNALS = set(_sys.builtin_module_names) | {
     "_io", "io", "_frozen_importlib", "_frozen_importlib_external",
     "zipimport", "encodings", "codecs", "importlib", "marshal",
@@ -330,7 +330,7 @@ def _restricted_open(file, mode="r", *args, **kwargs):
     caller_name = caller_globals.get("__package__") or caller_globals.get("__name__") or ""
 
     # Разрешаем файловые операции внутреннему коду зависимостей CadQuery/OCP:
-    # exporters CadQuery должны иметь возможность создать output.stp.
+    # exporters CadQuery должны иметь возможность создать output.step.
     if caller_name and caller_name != "__main__":
         return _orig_open(file, mode, *args, **kwargs)
 
@@ -340,7 +340,7 @@ def _restricted_open(file, mode="r", *args, **kwargs):
         return _orig_open(file, mode, *args, **kwargs)
 
     raise PermissionError(
-        "Файловые операции запрещены sandbox; разрешён только экспорт STEP в output.stp"
+        "Файловые операции запрещены sandbox; разрешён только экспорт STEP в output.step"
     )
 
 _bi.open = _restricted_open
@@ -389,7 +389,7 @@ def build_child_env() -> dict[str, str]:
 
 def run_cad_code(code: str, run_dir: Path, timeout_sec: int) -> tuple[bool, str, Path | None]:
     script_path = run_dir / "cad_generated.py"
-    step_path = run_dir / "output.stp"
+    step_path = run_dir / "output.step"
     stdout_path = run_dir / "stdout.txt"
     stderr_path = run_dir / "stderr.txt"
     full_code = SANDBOX_PREAMBLE + "\n\n" + code
@@ -434,8 +434,8 @@ def run_cad_code(code: str, run_dir: Path, timeout_sec: int) -> tuple[bool, str,
     if not valid:
         return False, f"Невалидный STEP: {reason}", None
 
-    index = len(list(OUTPUT_DIR.glob("*.stp"))) + 1
-    final_path = OUTPUT_DIR / f"model_{index}.stp"
+    index = len(list(OUTPUT_DIR.glob("*.step"))) + 1
+    final_path = OUTPUT_DIR / f"model_{index}.step"
     step_path.replace(final_path)
     logger.info("STEP перенесён в %s", final_path)
     return True, f"✅ {final_path} ({final_path.stat().st_size / 1024:.1f} KB)", final_path
@@ -666,7 +666,7 @@ def create_model(
                     Перегенерируй код строго по правилам:
                     - только cadquery и math
                     - финальная модель в result
-                    - экспорт через cq.exporters.export(result, \"output.stp\")
+                    - экспорт через cq.exporters.export(result, \"output.step\")
                     - без любых посторонних импортов и опасных вызовов
                     """
                 ).strip()
