@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Convert linework from DWG/DXF into IFC4 curve geometry.
 
+python dwg_lines_to_ifc.py input.dxf output.ifc --unit mm
+
 Supported CAD geometry:
 - LINE
 - LWPOLYLINE / POLYLINE (including bulge arcs after decomposition)
