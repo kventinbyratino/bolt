@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""Convert linework from DWG/DXF into IFC4 curve geometry.
+
+Supported CAD geometry:
+- LINE
+- LWPOLYLINE / POLYLINE (including bulge arcs after decomposition)
+- ARC / CIRCLE
+- ELLIPSE
+- SPLINE
+- geometry nested in INSERT block references
+
+DWG reading requires the free ODA File Converter installed locally.
+DXF files are read directly by ezdxf.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Iterable, Iterator, Sequence
+
+import ezdxf
+from ezdxf import recover, units
+from ezdxf.addons import odafc
+from ezdxf.disassemble import recursive_decompose
+from ezdxf.entities import DXFEntity
+from ezdxf.math import Vec3
+from ezdxf.path import make_path
+
+import ifcopenshell
+import ifcopenshell.api.aggregate
+import ifcopenshell.api.context
+import ifcopenshell.api.geometry
+import ifcopenshell.api.layer
+import ifcopenshell.api.project
+import ifcopenshell.api.pset
+import ifcopenshell.api.root
+import ifcopenshell.api.spatial
+import ifcopenshell.api.unit
+
+LOG = logging.getLogger("dwg_lines_to_ifc")
+
+SUPPORTED_TYPES = {"LINE", "LWPOLYLINE", "POLYLINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE"}
+UNIT_CODES = {
+    "in": units.IN,
+    "inch": units.IN,
+    "inches": units.IN,
+    "ft": units.FT,
+    "feet": units.FT,
+    "mm": units.MM,
+    "millimeter": units.MM,
+    "millimeters": units.MM,
+    "cm": units.CM,
+    "centimeter": units.CM,
+    "centimeters": units.CM,
+    "m": units.M,
+    "meter": units.M,
+    "meters": units.M,
+    "km": units.KM,
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert DWG/DXF line geometry to an IFC4 model."
+    )
+    parser.add_argument("input", type=Path, help="Input .dwg or .dxf file")
+    parser.add_argument("output", type=Path, help="Output .ifc file")
+    parser.add_argument(
+        "--unit",
+        default="auto",
+        choices=["auto", "mm", "cm", "m", "in", "ft"],
+        help=(
+            "Source drawing unit. 'auto' uses DXF $INSUNITS; "
+            "unitless drawings fall back to millimetres."
+        ),
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum curve approximation deviation in source drawing units "
+            "(default: 1.0). Smaller values create more segments."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1000,
+        help="Maximum curves per IFC annotation object (default: 1000).",
+    )
+    parser.add_argument(
+        "--include-layer",
+        action="append",
+        default=[],
+        help="Only include this exact CAD layer. May be supplied multiple times.",
+    )
+    parser.add_argument(
+        "--exclude-layer",
+        action="append",
+        default=[],
+        help="Exclude this exact CAD layer. May be supplied multiple times.",
+    )
+    parser.add_argument(
+        "--origin",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.0),
+        help=(
+            "Subtract this source-coordinate origin before writing IFC. "
+            "Useful for large survey coordinates."
+        ),
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable detailed logging."
+    )
+    return parser.parse_args()
+
+
+def load_cad(path: Path) -> ezdxf.document.Drawing:
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    suffix = path.suffix.lower()
+    if suffix == ".dwg":
+        if not odafc.is_installed():
+            raise RuntimeError(
+                "ODA File Converter is not installed or ezdxf cannot find it. "
+                "Install ODA File Converter, or convert the DWG to DXF first."
+            )
+        LOG.info("Reading DWG through ODA File Converter: %s", path)
+        return odafc.readfile(path, audit=True)
+
+    if suffix == ".dxf":
+        LOG.info("Reading DXF: %s", path)
+        try:
+            return ezdxf.readfile(path)
+        except ezdxf.DXFStructureError:
+            LOG.warning("DXF structure error; attempting recovery.")
+            doc, auditor = recover.readfile(path)
+            if auditor.has_errors:
+                LOG.warning("DXF recovery reported %d errors.", len(auditor.errors))
+            return doc
+
+    raise ValueError("Input must have .dwg or .dxf extension")
+
+
+def source_to_metre_scale(doc: ezdxf.document.Drawing, unit_arg: str) -> float:
+    if unit_arg != "auto":
+        return float(units.conversion_factor(UNIT_CODES[unit_arg], units.M))
+
+    code = int(doc.units)
+    if code == 0:
+        LOG.warning(
+            "Drawing $INSUNITS is unitless; assuming millimetres. "
+            "Override with --unit when needed."
+        )
+        code = units.MM
+
+    try:
+        scale = float(units.conversion_factor(code, units.M))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Unsupported or unknown DXF unit code {code}; specify --unit explicitly."
+        ) from exc
+
+    LOG.info("Source unit: %s; scale to metres: %.12g", units.unit_name(code), scale)
+    return scale
+
+
+def clean_points(points: Iterable[Vec3], epsilon: float = 1e-12) -> list[Vec3]:
+    result: list[Vec3] = []
+    for point in points:
+        p = Vec3(point)
+        if not result or not p.isclose(result[-1], abs_tol=epsilon):
+            result.append(p)
+    return result
+
+
+def entity_to_points(entity: DXFEntity, tolerance: float) -> list[Vec3] | None:
+    entity_type = entity.dxftype()
+
+    if entity_type == "LINE":
+        points = [Vec3(entity.dxf.start), Vec3(entity.dxf.end)]
+    elif entity_type in SUPPORTED_TYPES:
+        try:
+            path = make_path(entity)
+            points = list(path.flattening(distance=tolerance, segments=4))
+        except (TypeError, ValueError, ZeroDivisionError) as exc:
+            LOG.warning(
+                "Skipping %s handle=%s: %s",
+                entity_type,
+                getattr(entity.dxf, "handle", "?"),
+                exc,
+            )
+            return None
+    else:
+        return None
+
+    points = clean_points(points)
+    if len(points) < 2:
+        return None
+    return points
+
+
+def collect_linework(
+    doc: ezdxf.document.Drawing,
+    tolerance: float,
+    include_layers: set[str],
+    exclude_layers: set[str],
+) -> tuple[dict[str, list[list[Vec3]]], dict[str, int]]:
+    by_layer: dict[str, list[list[Vec3]]] = defaultdict(list)
+    stats: dict[str, int] = defaultdict(int)
+
+    # recursive_decompose expands INSERT blocks and compound entities into
+    # transformed virtual primitives, so nested block geometry is included.
+    for entity in recursive_decompose(doc.modelspace()):
+        entity_type = entity.dxftype()
+        layer = str(getattr(entity.dxf, "layer", "0") or "0")
+
+        if include_layers and layer not in include_layers:
+            stats["filtered"] += 1
+            continue
+        if layer in exclude_layers:
+            stats["filtered"] += 1
+            continue
+
+        points = entity_to_points(entity, tolerance)
+        if points is None:
+            stats[f"skipped_{entity_type}"] += 1
+            continue
+
+        by_layer[layer].append(points)
+        stats[entity_type] += 1
+        stats["curves"] += 1
+        stats["vertices"] += len(points)
+
+    return dict(by_layer), dict(stats)
+
+
+def chunks(values: Sequence[list[Vec3]], size: int) -> Iterator[Sequence[list[Vec3]]]:
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def create_ifc_base() -> tuple[
+    ifcopenshell.file,
+    ifcopenshell.entity_instance,
+    ifcopenshell.entity_instance,
+]:
+    model = ifcopenshell.api.project.create_file(version="IFC4")
+
+    project = ifcopenshell.api.root.create_entity(
+        model, ifc_class="IfcProject", name="DWG/DXF Linework Import"
+    )
+
+    metre = ifcopenshell.api.unit.add_si_unit(model, unit_type="LENGTHUNIT")
+    ifcopenshell.api.unit.assign_unit(model, units=[metre])
+
+    model_context = ifcopenshell.api.context.add_context(
+        model, context_type="Model"
+    )
+    body_context = ifcopenshell.api.context.add_context(
+        model,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=model_context,
+    )
+
+    site = ifcopenshell.api.root.create_entity(
+        model, ifc_class="IfcSite", name="Imported CAD Site"
+    )
+    building = ifcopenshell.api.root.create_entity(
+        model, ifc_class="IfcBuilding", name="Imported CAD Building"
+    )
+    storey = ifcopenshell.api.root.create_entity(
+        model, ifc_class="IfcBuildingStorey", name="CAD Linework"
+    )
+
+    ifcopenshell.api.aggregate.assign_object(
+        model, products=[site], relating_object=project
+    )
+    ifcopenshell.api.aggregate.assign_object(
+        model, products=[building], relating_object=site
+    )
+    ifcopenshell.api.aggregate.assign_object(
+        model, products=[storey], relating_object=building
+    )
+
+    # Explicit identity placements improve compatibility with IFC viewers.
+    for product in (site, building, storey):
+        ifcopenshell.api.geometry.edit_object_placement(model, product=product)
+
+    return model, body_context, storey
+
+
+def vec_to_ifc_coordinates(
+    point: Vec3,
+    scale_to_m: float,
+    origin: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (
+        (float(point.x) - origin[0]) * scale_to_m,
+        (float(point.y) - origin[1]) * scale_to_m,
+        (float(point.z) - origin[2]) * scale_to_m,
+    )
+
+
+def write_ifc(
+    output: Path,
+    source: Path,
+    by_layer: dict[str, list[list[Vec3]]],
+    scale_to_m: float,
+    origin: tuple[float, float, float],
+    chunk_size: int,
+) -> tuple[int, int]:
+    model, body_context, storey = create_ifc_base()
+    annotation_count = 0
+    curve_count = 0
+
+    for layer_name in sorted(by_layer):
+        layer_curves = by_layer[layer_name]
+        presentation_layer = ifcopenshell.api.layer.add_layer(
+            model, name=layer_name
+        )
+
+        total_parts = math.ceil(len(layer_curves) / chunk_size)
+        for part_number, curve_chunk in enumerate(
+            chunks(layer_curves, chunk_size), start=1
+        ):
+            suffix = f" [{part_number}/{total_parts}]" if total_parts > 1 else ""
+            annotation = ifcopenshell.api.root.create_entity(
+                model,
+                ifc_class="IfcAnnotation",
+                name=f"CAD layer: {layer_name}{suffix}",
+            )
+            ifcopenshell.api.geometry.edit_object_placement(
+                model, product=annotation
+            )
+
+            ifc_curves = []
+            for polyline in curve_chunk:
+                ifc_points = [
+                    model.create_entity(
+                        "IfcCartesianPoint",
+                        Coordinates=vec_to_ifc_coordinates(
+                            point, scale_to_m, origin
+                        ),
+                    )
+                    for point in polyline
+                ]
+                ifc_curves.append(
+                    model.create_entity("IfcPolyline", Points=ifc_points)
+                )
+
+            representation = model.create_entity(
+                "IfcShapeRepresentation",
+                ContextOfItems=body_context,
+                RepresentationIdentifier="Body",
+                RepresentationType="Curve3D",
+                Items=ifc_curves,
+            )
+            ifcopenshell.api.geometry.assign_representation(
+                model, product=annotation, representation=representation
+            )
+            ifcopenshell.api.spatial.assign_container(
+                model, products=[annotation], relating_structure=storey
+            )
+            ifcopenshell.api.layer.assign_layer(
+                model, items=[representation], layer=presentation_layer
+            )
+
+            pset = ifcopenshell.api.pset.add_pset(
+                model, product=annotation, name="Pset_CADImport"
+            )
+            ifcopenshell.api.pset.edit_pset(
+                model,
+                pset=pset,
+                properties={
+                    "SourceFile": source.name,
+                    "CADLayer": layer_name,
+                    "CurveCount": len(ifc_curves),
+                    "CoordinateScaleToMetres": scale_to_m,
+                    "SourceOriginX": origin[0],
+                    "SourceOriginY": origin[1],
+                    "SourceOriginZ": origin[2],
+                },
+            )
+
+            annotation_count += 1
+            curve_count += len(ifc_curves)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    model.write(str(output))
+    return annotation_count, curve_count
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    if args.tolerance <= 0:
+        raise ValueError("--tolerance must be greater than zero")
+    if args.chunk_size <= 0:
+        raise ValueError("--chunk-size must be greater than zero")
+
+    input_path = args.input.resolve()
+    output_path = args.output.resolve()
+    origin = tuple(float(value) for value in args.origin)
+
+    doc = load_cad(input_path)
+    scale_to_m = source_to_metre_scale(doc, args.unit)
+    linework, stats = collect_linework(
+        doc,
+        tolerance=args.tolerance,
+        include_layers=set(args.include_layer),
+        exclude_layers=set(args.exclude_layer),
+    )
+
+    if not linework:
+        raise RuntimeError(
+            "No supported line geometry was found in modelspace after filtering."
+        )
+
+    annotations, curves = write_ifc(
+        output=output_path,
+        source=input_path,
+        by_layer=linework,
+        scale_to_m=scale_to_m,
+        origin=origin,
+        chunk_size=args.chunk_size,
+    )
+
+    LOG.info("IFC written: %s", output_path)
+    LOG.info(
+        "Layers=%d, curves=%d, vertices=%d, IFC annotations=%d",
+        len(linework),
+        curves,
+        stats.get("vertices", 0),
+        annotations,
+    )
+    skipped = sum(
+        count for key, count in stats.items() if key.startswith("skipped_")
+    )
+    if skipped:
+        LOG.info("Skipped unsupported/invalid entities: %d", skipped)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        LOG.error("%s", exc)
+        if "--verbose" in sys.argv:
+            raise
+        raise SystemExit(1)
