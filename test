@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+#2!/usr/bin/env python3
 """Convert linework from DWG/DXF into IFC4 curve geometry.
 
-python dwg_lines_to_ifc.py input.dxf output.ifc --unit mm
+python dwg_lines_to_ifc.py input.dxf output.ifc --unit mm --line-width-mm 2
 
 Supported CAD geometry:
 - LINE
