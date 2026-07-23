@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""Convert DWG/DXF linework into thin 3D IFC solids.
+#!5/usr/bin/env python3
+"""Convert DXF linework into thin 3D IFC solids.
 
 Output geometry:
 - IfcBuildingElementProxy
@@ -17,7 +17,11 @@ Supported CAD geometry:
 - SPLINE
 - geometry nested in INSERT block references
 
-DWG reading requires ODA File Converter. DXF files are read directly by ezdxf.
+DXF files are read directly by ezdxf.
+
+When started without command-line arguments, a minimal Tkinter desktop
+interface opens for choosing the source DXF file. The IFC is written next to
+the DXF with the same base name.
 """
 
 from __future__ import annotations
@@ -32,7 +36,6 @@ from typing import Iterable, Iterator, Sequence
 
 import ezdxf
 from ezdxf import recover, units
-from ezdxf.addons import odafc
 from ezdxf.disassemble import recursive_decompose
 from ezdxf.entities import DXFEntity
 from ezdxf.math import Vec3
@@ -49,7 +52,7 @@ import ifcopenshell.api.root
 import ifcopenshell.api.spatial
 import ifcopenshell.api.unit
 
-LOG = logging.getLogger("dwg_lines_to_ifc")
+LOG = logging.getLogger("dxf_to_ifc")
 
 SUPPORTED_TYPES = {
     "LINE",
@@ -80,87 +83,78 @@ UNIT_CODES = {
 }
 
 EPSILON_M = 1e-9
-VERSION = "2.1.0"
+VERSION = "2.2.0"
+
+DEFAULT_SOURCE_UNIT = "mm"
+DEFAULT_TOLERANCE = 1.0
+DEFAULT_LINE_WIDTH_MM = 3.0
+DEFAULT_LINE_HEIGHT_MM = 2.0
+DEFAULT_CHUNK_SIZE = 500
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert DWG/DXF line geometry into thin IFC4 3D solids "
-            "stored as IfcBuildingElementProxy."
+            "Convert DXF line geometry into thin IFC4 3D solids "
+            "stored as IfcBuildingElementProxy. Run without arguments for GUI."
         )
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    parser.add_argument("input", type=Path, help="Input .dwg or .dxf file")
-    parser.add_argument("output", type=Path, help="Output .ifc file")
+    parser.add_argument("input", nargs="?", type=Path, help="Input .dxf file")
+    parser.add_argument(
+        "output",
+        nargs="?",
+        type=Path,
+        help="Output .ifc file; defaults to the input name with .ifc extension",
+    )
     parser.add_argument(
         "--unit",
-        default="auto",
+        default=DEFAULT_SOURCE_UNIT,
         choices=["auto", "mm", "cm", "m", "in", "ft"],
-        help=(
-            "Source drawing unit. 'auto' uses DXF $INSUNITS; "
-            "unitless drawings fall back to millimetres."
-        ),
+        help=f"Source drawing unit (default: {DEFAULT_SOURCE_UNIT}).",
     )
     parser.add_argument(
         "--tolerance",
         type=float,
-        default=1.0,
+        default=DEFAULT_TOLERANCE,
         help=(
             "Maximum curve approximation deviation in source drawing units "
-            "(default: 1.0). Smaller values create more solid segments."
+            f"(default: {DEFAULT_TOLERANCE})."
         ),
     )
     parser.add_argument(
         "--line-width-mm", "--width-mm",
         type=float,
-        default=2.0,
-        help="Width of every rectangular line solid in millimetres (default: 2).",
+        default=DEFAULT_LINE_WIDTH_MM,
+        help=f"Width of every line solid in millimetres (default: {DEFAULT_LINE_WIDTH_MM}).",
     )
     parser.add_argument(
         "--line-height-mm", "--height-mm",
         type=float,
-        default=1.0,
-        help=(
-            "Uniform Z height of every line solid in millimetres (default: 1). "
-            "All solids start at Z=0."
-        ),
+        default=DEFAULT_LINE_HEIGHT_MM,
+        help=f"Height of every line solid in millimetres (default: {DEFAULT_LINE_HEIGHT_MM}).",
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=500,
-        help=(
-            "Maximum source curves grouped into one IfcBuildingElementProxy "
-            "(default: 500)."
-        ),
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"Maximum source curves per IFC proxy (default: {DEFAULT_CHUNK_SIZE}).",
     )
     parser.add_argument(
-        "--include-layer",
-        action="append",
-        default=[],
+        "--include-layer", action="append", default=[],
         help="Only include this exact CAD layer. May be supplied multiple times.",
     )
     parser.add_argument(
-        "--exclude-layer",
-        action="append",
-        default=[],
+        "--exclude-layer", action="append", default=[],
         help="Exclude this exact CAD layer. May be supplied multiple times.",
     )
     parser.add_argument(
-        "--origin",
-        nargs=3,
-        type=float,
-        metavar=("X", "Y", "Z"),
+        "--origin", nargs=3, type=float, metavar=("X", "Y", "Z"),
         default=(0.0, 0.0, 0.0),
-        help=(
-            "Subtract X and Y from source coordinates before writing IFC. "
-            "The supplied Z value is recorded only; source Z is always discarded."
-        ),
+        help="Subtract X and Y before writing IFC; source Z is always discarded.",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Enable detailed logging."
-    )
+    parser.add_argument("--gui", action="store_true", help="Open the desktop interface.")
+    parser.add_argument("--verbose", action="store_true", help="Enable detailed logging.")
     return parser.parse_args()
 
 
@@ -168,28 +162,18 @@ def load_cad(path: Path) -> ezdxf.document.Drawing:
     if not path.exists():
         raise FileNotFoundError(path)
 
-    suffix = path.suffix.lower()
-    if suffix == ".dwg":
-        if not odafc.is_installed():
-            raise RuntimeError(
-                "ODA File Converter is not installed or ezdxf cannot find it. "
-                "Install ODA File Converter, or convert the DWG to DXF first."
-            )
-        LOG.info("Reading DWG through ODA File Converter: %s", path)
-        return odafc.readfile(path, audit=True)
+    if path.suffix.lower() != ".dxf":
+        raise ValueError("Input must have .dxf extension")
 
-    if suffix == ".dxf":
-        LOG.info("Reading DXF: %s", path)
-        try:
-            return ezdxf.readfile(path)
-        except ezdxf.DXFStructureError:
-            LOG.warning("DXF structure error; attempting recovery.")
-            doc, auditor = recover.readfile(path)
-            if auditor.has_errors:
-                LOG.warning("DXF recovery reported %d errors.", len(auditor.errors))
-            return doc
-
-    raise ValueError("Input must have .dwg or .dxf extension")
+    LOG.info("Reading DXF: %s", path)
+    try:
+        return ezdxf.readfile(path)
+    except ezdxf.DXFStructureError:
+        LOG.warning("DXF structure error; attempting recovery.")
+        doc, auditor = recover.readfile(path)
+        if auditor.has_errors:
+            LOG.warning("DXF recovery reported %d errors.", len(auditor.errors))
+        return doc
 
 
 def source_to_metre_scale(doc: ezdxf.document.Drawing, unit_arg: str) -> float:
@@ -307,7 +291,7 @@ def create_ifc_base() -> tuple[
     model = ifcopenshell.api.project.create_file(version="IFC4")
 
     project = ifcopenshell.api.root.create_entity(
-        model, ifc_class="IfcProject", name="DWG/DXF Solid Linework Import"
+        model, ifc_class="IfcProject", name="DXF Solid Linework Import"
     )
 
     metre = ifcopenshell.api.unit.add_si_unit(model, unit_type="LENGTHUNIT")
@@ -630,33 +614,46 @@ def write_ifc(
     return proxy_count, solid_count, skipped_zero_length
 
 
-def main() -> int:
-    args = parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
+def validate_options(
+    tolerance: float,
+    chunk_size: int,
+    line_width_mm: float,
+    line_height_mm: float,
+) -> None:
+    if tolerance <= 0:
+        raise ValueError("Tolerance must be greater than zero")
+    if chunk_size <= 0:
+        raise ValueError("Chunk size must be greater than zero")
+    if line_width_mm <= 0:
+        raise ValueError("Line width must be greater than zero")
+    if line_height_mm <= 0:
+        raise ValueError("Line height must be greater than zero")
 
-    if args.tolerance <= 0:
-        raise ValueError("--tolerance must be greater than zero")
-    if args.chunk_size <= 0:
-        raise ValueError("--chunk-size must be greater than zero")
-    if args.line_width_mm <= 0:
-        raise ValueError("--line-width-mm must be greater than zero")
-    if args.line_height_mm <= 0:
-        raise ValueError("--line-height-mm must be greater than zero")
 
-    input_path = args.input.resolve()
-    output_path = args.output.resolve()
-    origin = tuple(float(value) for value in args.origin)
+def convert_dxf_to_ifc(
+    input_path: Path,
+    output_path: Path,
+    *,
+    unit: str = DEFAULT_SOURCE_UNIT,
+    tolerance: float = DEFAULT_TOLERANCE,
+    line_width_mm: float = DEFAULT_LINE_WIDTH_MM,
+    line_height_mm: float = DEFAULT_LINE_HEIGHT_MM,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    include_layers: set[str] | None = None,
+    exclude_layers: set[str] | None = None,
+    origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> tuple[int, int, int]:
+    validate_options(tolerance, chunk_size, line_width_mm, line_height_mm)
 
+    input_path = input_path.resolve()
+    output_path = output_path.resolve()
     doc = load_cad(input_path)
-    scale_to_m = source_to_metre_scale(doc, args.unit)
+    scale_to_m = source_to_metre_scale(doc, unit)
     linework, stats = collect_linework(
         doc,
-        tolerance=args.tolerance,
-        include_layers=set(args.include_layer),
-        exclude_layers=set(args.exclude_layer),
+        tolerance=tolerance,
+        include_layers=include_layers or set(),
+        exclude_layers=exclude_layers or set(),
     )
 
     if not linework:
@@ -670,26 +667,21 @@ def main() -> int:
         by_layer=linework,
         scale_to_m=scale_to_m,
         origin=origin,
-        chunk_size=args.chunk_size,
-        line_width_mm=args.line_width_mm,
-        line_height_mm=args.line_height_mm,
+        chunk_size=chunk_size,
+        line_width_mm=line_width_mm,
+        line_height_mm=line_height_mm,
     )
 
     LOG.info("IFC written: %s", output_path)
     LOG.info(
         "Layers=%d, source curves=%d, solid segments=%d, "
         "IfcBuildingElementProxy=%d, IfcAnnotation=0",
-        len(linework),
-        stats.get("curves", 0),
-        solids,
-        proxies,
+        len(linework), stats.get("curves", 0), solids, proxies,
     )
     LOG.info(
         "All solids: base Z=0, top Z=%.6f m, width=%.3f mm",
-        args.line_height_mm / 1000.0,
-        args.line_width_mm,
+        line_height_mm / 1000.0, line_width_mm,
     )
-
     if skipped_zero_length:
         LOG.info("Skipped zero-length segments: %d", skipped_zero_length)
 
@@ -699,6 +691,120 @@ def main() -> int:
     if skipped:
         LOG.info("Skipped unsupported/invalid entities: %d", skipped)
 
+    return proxies, solids, skipped_zero_length
+
+
+def run_gui() -> int:
+    import threading
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    root = tk.Tk()
+    root.title("DXF → IFC")
+    root.resizable(False, False)
+
+    selected_file = tk.StringVar()
+    status = tk.StringVar(value="Выберите исходный DXF-файл")
+
+    frame = ttk.Frame(root, padding=16)
+    frame.grid(row=0, column=0, sticky="nsew")
+
+    ttk.Label(frame, text="Исходный DXF:").grid(row=0, column=0, sticky="w")
+    entry = ttk.Entry(frame, textvariable=selected_file, width=58, state="readonly")
+    entry.grid(row=1, column=0, padx=(0, 8), pady=(4, 12))
+
+    def choose_file() -> None:
+        filename = filedialog.askopenfilename(
+            title="Выберите DXF-файл",
+            filetypes=[("DXF files", "*.dxf"), ("All files", "*.*")],
+        )
+        if filename:
+            selected_file.set(filename)
+            status.set(f"Результат: {Path(filename).with_suffix('.ifc').name}")
+            convert_button.configure(state="normal")
+
+    def finish_success(output_path: Path, proxies: int, solids: int) -> None:
+        convert_button.configure(state="normal")
+        choose_button.configure(state="normal")
+        status.set(f"Готово: {output_path}")
+        messagebox.showinfo(
+            "DXF → IFC",
+            f"IFC создан:\n{output_path}\n\n"
+            f"IfcBuildingElementProxy: {proxies}\n"
+            f"3D-сегментов: {solids}",
+        )
+
+    def finish_error(exc: Exception) -> None:
+        convert_button.configure(state="normal")
+        choose_button.configure(state="normal")
+        status.set("Ошибка конвертации")
+        messagebox.showerror("DXF → IFC", str(exc))
+
+    def worker(input_path: Path, output_path: Path) -> None:
+        try:
+            proxies, solids, _ = convert_dxf_to_ifc(input_path, output_path)
+        except Exception as exc:
+            root.after(0, finish_error, exc)
+        else:
+            root.after(0, finish_success, output_path, proxies, solids)
+
+    def start_conversion() -> None:
+        value = selected_file.get().strip()
+        if not value:
+            messagebox.showwarning("DXF → IFC", "Сначала выберите DXF-файл.")
+            return
+
+        input_path = Path(value)
+        output_path = input_path.with_suffix(".ifc")
+        convert_button.configure(state="disabled")
+        choose_button.configure(state="disabled")
+        status.set("Конвертация…")
+        threading.Thread(
+            target=worker, args=(input_path, output_path), daemon=True
+        ).start()
+
+    choose_button = ttk.Button(frame, text="Выбрать…", command=choose_file)
+    choose_button.grid(row=1, column=1, pady=(4, 12))
+
+    convert_button = ttk.Button(
+        frame, text="Преобразовать в IFC", command=start_conversion, state="disabled"
+    )
+    convert_button.grid(row=2, column=0, columnspan=2, sticky="ew")
+
+    ttk.Label(frame, textvariable=status, wraplength=520).grid(
+        row=3, column=0, columnspan=2, sticky="w", pady=(12, 0)
+    )
+
+    root.mainloop()
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    if args.gui or args.input is None:
+        return run_gui()
+
+    input_path = args.input
+    output_path = args.output or input_path.with_suffix(".ifc")
+    origin = tuple(float(value) for value in args.origin)
+
+    convert_dxf_to_ifc(
+        input_path=input_path,
+        output_path=output_path,
+        unit=args.unit,
+        tolerance=args.tolerance,
+        line_width_mm=args.line_width_mm,
+        line_height_mm=args.line_height_mm,
+        chunk_size=args.chunk_size,
+        include_layers=set(args.include_layer),
+        exclude_layers=set(args.exclude_layer),
+        origin=origin,
+    )
     return 0
 
 
