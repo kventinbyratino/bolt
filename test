@@ -1,16 +1,23 @@
-#4!/usr/bin/env python3
-"""Convert linework from DWG/DXF into IFC4 curve geometry.
+#!/usr/bin/env python3
+"""Convert DWG/DXF linework into thin 3D IFC solids.
+
+Output geometry:
+- IfcBuildingElementProxy
+- IfcShapeRepresentation: Body / SweptSolid
+- one IfcExtrudedAreaSolid with IfcRectangleProfileDef per CAD segment
+
+All source Z coordinates are discarded after CAD block transformations.
+Every solid starts at global Z=0 and is extruded vertically by a uniform height.
 
 Supported CAD geometry:
 - LINE
-- LWPOLYLINE / POLYLINE (including bulge arcs after decomposition)
+- LWPOLYLINE / POLYLINE, including bulge arcs after decomposition
 - ARC / CIRCLE
 - ELLIPSE
 - SPLINE
 - geometry nested in INSERT block references
 
-DWG reading requires the free ODA File Converter installed locally.
-DXF files are read directly by ezdxf.
+DWG reading requires ODA File Converter. DXF files are read directly by ezdxf.
 """
 
 from __future__ import annotations
@@ -44,7 +51,16 @@ import ifcopenshell.api.unit
 
 LOG = logging.getLogger("dwg_lines_to_ifc")
 
-SUPPORTED_TYPES = {"LINE", "LWPOLYLINE", "POLYLINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE"}
+SUPPORTED_TYPES = {
+    "LINE",
+    "LWPOLYLINE",
+    "POLYLINE",
+    "ARC",
+    "CIRCLE",
+    "ELLIPSE",
+    "SPLINE",
+}
+
 UNIT_CODES = {
     "in": units.IN,
     "inch": units.IN,
@@ -63,11 +79,18 @@ UNIT_CODES = {
     "km": units.KM,
 }
 
+EPSILON_M = 1e-9
+VERSION = "2.1.0"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert DWG/DXF line geometry to an IFC4 model."
+        description=(
+            "Convert DWG/DXF line geometry into thin IFC4 3D solids "
+            "stored as IfcBuildingElementProxy."
+        )
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("input", type=Path, help="Input .dwg or .dxf file")
     parser.add_argument("output", type=Path, help="Output .ifc file")
     parser.add_argument(
@@ -85,14 +108,32 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help=(
             "Maximum curve approximation deviation in source drawing units "
-            "(default: 1.0). Smaller values create more segments."
+            "(default: 1.0). Smaller values create more solid segments."
+        ),
+    )
+    parser.add_argument(
+        "--line-width-mm", "--width-mm",
+        type=float,
+        default=2.0,
+        help="Width of every rectangular line solid in millimetres (default: 2).",
+    )
+    parser.add_argument(
+        "--line-height-mm", "--height-mm",
+        type=float,
+        default=1.0,
+        help=(
+            "Uniform Z height of every line solid in millimetres (default: 1). "
+            "All solids start at Z=0."
         ),
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=1000,
-        help="Maximum curves per IFC annotation object (default: 1000).",
+        default=500,
+        help=(
+            "Maximum source curves grouped into one IfcBuildingElementProxy "
+            "(default: 500)."
+        ),
     )
     parser.add_argument(
         "--include-layer",
@@ -113,8 +154,8 @@ def parse_args() -> argparse.Namespace:
         metavar=("X", "Y", "Z"),
         default=(0.0, 0.0, 0.0),
         help=(
-            "Subtract this source-coordinate origin before writing IFC. "
-            "Useful for large survey coordinates."
+            "Subtract X and Y from source coordinates before writing IFC. "
+            "The supplied Z value is recorded only; source Z is always discarded."
         ),
     )
     parser.add_argument(
@@ -174,10 +215,17 @@ def source_to_metre_scale(doc: ezdxf.document.Drawing, unit_arg: str) -> float:
     return scale
 
 
+def flatten_xy(point: Vec3) -> Vec3:
+    """Project a transformed CAD point to the global XY plane."""
+    p = Vec3(point)
+    return Vec3(float(p.x), float(p.y), 0.0)
+
+
 def clean_points(points: Iterable[Vec3], epsilon: float = 1e-12) -> list[Vec3]:
+    """Flatten to Z=0 and remove consecutive duplicate XY vertices."""
     result: list[Vec3] = []
     for point in points:
-        p = Vec3(point)
+        p = flatten_xy(point)
         if not result or not p.isclose(result[-1], abs_tol=epsilon):
             result.append(p)
     return result
@@ -203,6 +251,8 @@ def entity_to_points(entity: DXFEntity, tolerance: float) -> list[Vec3] | None:
     else:
         return None
 
+    # recursive_decompose() has already applied INSERT transformations.
+    # Flatten only after that transformation so every resulting WCS point gets Z=0.
     points = clean_points(points)
     if len(points) < 2:
         return None
@@ -218,8 +268,7 @@ def collect_linework(
     by_layer: dict[str, list[list[Vec3]]] = defaultdict(list)
     stats: dict[str, int] = defaultdict(int)
 
-    # recursive_decompose expands INSERT blocks and compound entities into
-    # transformed virtual primitives, so nested block geometry is included.
+    # Expands INSERT blocks and compound entities into transformed virtual primitives.
     for entity in recursive_decompose(doc.modelspace()):
         entity_type = entity.dxftype()
         layer = str(getattr(entity.dxf, "layer", "0") or "0")
@@ -240,6 +289,7 @@ def collect_linework(
         stats[entity_type] += 1
         stats["curves"] += 1
         stats["vertices"] += len(points)
+        stats["segments"] += max(0, len(points) - 1)
 
     return dict(by_layer), dict(stats)
 
@@ -257,7 +307,7 @@ def create_ifc_base() -> tuple[
     model = ifcopenshell.api.project.create_file(version="IFC4")
 
     project = ifcopenshell.api.root.create_entity(
-        model, ifc_class="IfcProject", name="DWG/DXF Linework Import"
+        model, ifc_class="IfcProject", name="DWG/DXF Solid Linework Import"
     )
 
     metre = ifcopenshell.api.unit.add_si_unit(model, unit_type="LENGTHUNIT")
@@ -281,8 +331,9 @@ def create_ifc_base() -> tuple[
         model, ifc_class="IfcBuilding", name="Imported CAD Building"
     )
     storey = ifcopenshell.api.root.create_entity(
-        model, ifc_class="IfcBuildingStorey", name="CAD Linework"
+        model, ifc_class="IfcBuildingStorey", name="CAD Solid Linework"
     )
+    storey.Elevation = 0.0
 
     ifcopenshell.api.aggregate.assign_object(
         model, products=[site], relating_object=project
@@ -294,23 +345,175 @@ def create_ifc_base() -> tuple[
         model, products=[storey], relating_object=building
     )
 
-    # Explicit identity placements improve compatibility with IFC viewers.
+    # All spatial placements are explicit identity matrices at global Z=0.
     for product in (site, building, storey):
         ifcopenshell.api.geometry.edit_object_placement(model, product=product)
 
     return model, body_context, storey
 
 
-def vec_to_ifc_coordinates(
+def point_to_xy_metres(
     point: Vec3,
     scale_to_m: float,
     origin: tuple[float, float, float],
-) -> tuple[float, float, float]:
+) -> tuple[float, float]:
+    """Return only X/Y; source Z is intentionally ignored."""
     return (
         (float(point.x) - origin[0]) * scale_to_m,
         (float(point.y) - origin[1]) * scale_to_m,
-        (float(point.z) - origin[2]) * scale_to_m,
     )
+
+
+def make_axis2placement2d(model: ifcopenshell.file) -> ifcopenshell.entity_instance:
+    return model.create_entity(
+        "IfcAxis2Placement2D",
+        Location=model.create_entity(
+            "IfcCartesianPoint", Coordinates=(0.0, 0.0)
+        ),
+        RefDirection=model.create_entity(
+            "IfcDirection", DirectionRatios=(1.0, 0.0)
+        ),
+    )
+
+
+def make_segment_solid(
+    model: ifcopenshell.file,
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+    width_m: float,
+    height_m: float,
+) -> ifcopenshell.entity_instance | None:
+    """Create a rectangular prism whose base is exactly on global Z=0."""
+    x1, y1 = start_xy
+    x2, y2 = end_xy
+    dx = x2 - x1
+    dy = y2 - y1
+    length = math.hypot(dx, dy)
+    if length <= EPSILON_M:
+        return None
+
+    ux = dx / length
+    uy = dy / length
+    mid_x = (x1 + x2) * 0.5
+    mid_y = (y1 + y2) * 0.5
+
+    profile = model.create_entity(
+        "IfcRectangleProfileDef",
+        ProfileType="AREA",
+        ProfileName="DWG line rectangular profile",
+        Position=make_axis2placement2d(model),
+        XDim=float(length),
+        YDim=float(width_m),
+    )
+
+    # The profile's local X axis follows the CAD segment. Its placement Z is 0.
+    solid_position = model.create_entity(
+        "IfcAxis2Placement3D",
+        Location=model.create_entity(
+            "IfcCartesianPoint",
+            Coordinates=(float(mid_x), float(mid_y), 0.0),
+        ),
+        Axis=model.create_entity(
+            "IfcDirection", DirectionRatios=(0.0, 0.0, 1.0)
+        ),
+        RefDirection=model.create_entity(
+            "IfcDirection", DirectionRatios=(float(ux), float(uy), 0.0)
+        ),
+    )
+
+    return model.create_entity(
+        "IfcExtrudedAreaSolid",
+        SweptArea=profile,
+        Position=solid_position,
+        ExtrudedDirection=model.create_entity(
+            "IfcDirection", DirectionRatios=(0.0, 0.0, 1.0)
+        ),
+        Depth=float(height_m),
+    )
+
+
+def make_chunk_solids(
+    model: ifcopenshell.file,
+    curve_chunk: Sequence[list[Vec3]],
+    scale_to_m: float,
+    origin: tuple[float, float, float],
+    width_m: float,
+    height_m: float,
+) -> tuple[list[ifcopenshell.entity_instance], int]:
+    solids: list[ifcopenshell.entity_instance] = []
+    skipped_zero_length = 0
+
+    for polyline in curve_chunk:
+        xy_points = [
+            point_to_xy_metres(point, scale_to_m, origin) for point in polyline
+        ]
+        for start_xy, end_xy in zip(xy_points, xy_points[1:]):
+            solid = make_segment_solid(
+                model=model,
+                start_xy=start_xy,
+                end_xy=end_xy,
+                width_m=width_m,
+                height_m=height_m,
+            )
+            if solid is None:
+                skipped_zero_length += 1
+                continue
+            solids.append(solid)
+
+    return solids, skipped_zero_length
+
+
+def validate_model(
+    model: ifcopenshell.file,
+    expected_height_m: float,
+    tolerance: float = 1e-9,
+) -> tuple[int, int]:
+    """Fail if annotations or non-flat solid placements remain."""
+    annotations = model.by_type("IfcAnnotation")
+    if annotations:
+        raise RuntimeError(
+            f"Internal validation failed: {len(annotations)} IfcAnnotation objects remain."
+        )
+
+    curves = (
+        model.by_type("IfcPolyline")
+        + model.by_type("IfcGeometricCurveSet")
+    )
+    if curves:
+        raise RuntimeError(
+            "Internal validation failed: curve geometry remains in the IFC."
+        )
+
+    proxies = model.by_type("IfcBuildingElementProxy")
+    solids = model.by_type("IfcExtrudedAreaSolid")
+    if not proxies or not solids:
+        raise RuntimeError(
+            "Internal validation failed: no proxy solid geometry was created."
+        )
+
+    for solid in solids:
+        coords = tuple(float(v) for v in solid.Position.Location.Coordinates)
+        z = coords[2] if len(coords) >= 3 else 0.0
+        if abs(z) > tolerance:
+            raise RuntimeError(
+                f"Internal validation failed: solid #{solid.id()} starts at Z={z}."
+            )
+
+        direction = tuple(float(v) for v in solid.ExtrudedDirection.DirectionRatios)
+        if len(direction) < 3 or any(
+            abs(a - b) > tolerance
+            for a, b in zip(direction[:3], (0.0, 0.0, 1.0))
+        ):
+            raise RuntimeError(
+                f"Internal validation failed: solid #{solid.id()} has invalid extrusion direction."
+            )
+
+        if abs(float(solid.Depth) - expected_height_m) > tolerance:
+            raise RuntimeError(
+                f"Internal validation failed: solid #{solid.id()} has inconsistent height."
+            )
+
+    return len(proxies), len(solids)
 
 
 def write_ifc(
@@ -320,10 +523,16 @@ def write_ifc(
     scale_to_m: float,
     origin: tuple[float, float, float],
     chunk_size: int,
-) -> tuple[int, int]:
+    line_width_mm: float,
+    line_height_mm: float,
+) -> tuple[int, int, int]:
     model, body_context, storey = create_ifc_base()
-    annotation_count = 0
-    curve_count = 0
+
+    width_m = line_width_mm / 1000.0
+    height_m = line_height_mm / 1000.0
+    proxy_count = 0
+    solid_count = 0
+    skipped_zero_length = 0
 
     for layer_name in sorted(by_layer):
         layer_curves = by_layer[layer_name]
@@ -335,50 +544,53 @@ def write_ifc(
         for part_number, curve_chunk in enumerate(
             chunks(layer_curves, chunk_size), start=1
         ):
-            suffix = f" [{part_number}/{total_parts}]" if total_parts > 1 else ""
-            annotation = ifcopenshell.api.root.create_entity(
-                model,
-                ifc_class="IfcAnnotation",
-                name=f"CAD layer: {layer_name}{suffix}",
+            solids, skipped = make_chunk_solids(
+                model=model,
+                curve_chunk=curve_chunk,
+                scale_to_m=scale_to_m,
+                origin=origin,
+                width_m=width_m,
+                height_m=height_m,
             )
-            ifcopenshell.api.geometry.edit_object_placement(
-                model, product=annotation
-            )
+            skipped_zero_length += skipped
+            if not solids:
+                continue
 
-            ifc_curves = []
-            for polyline in curve_chunk:
-                ifc_points = [
-                    model.create_entity(
-                        "IfcCartesianPoint",
-                        Coordinates=vec_to_ifc_coordinates(
-                            point, scale_to_m, origin
-                        ),
-                    )
-                    for point in polyline
-                ]
-                ifc_curves.append(
-                    model.create_entity("IfcPolyline", Points=ifc_points)
-                )
+            suffix = f" [{part_number}/{total_parts}]" if total_parts > 1 else ""
+            proxy = ifcopenshell.api.root.create_entity(
+                model,
+                ifc_class="IfcBuildingElementProxy",
+                name=f"CAD solids: {layer_name}{suffix}",
+            )
+            proxy.ObjectType = "DWG_LINE_SOLIDS"
+            proxy.PredefinedType = "USERDEFINED"
+
+            # Proxy placement is also identity at Z=0. Segment positions are in the body.
+            ifcopenshell.api.geometry.edit_object_placement(
+                model, product=proxy
+            )
 
             representation = model.create_entity(
                 "IfcShapeRepresentation",
                 ContextOfItems=body_context,
                 RepresentationIdentifier="Body",
-                RepresentationType="Curve3D",
-                Items=ifc_curves,
+                RepresentationType="SweptSolid",
+                Items=solids,
             )
             ifcopenshell.api.geometry.assign_representation(
-                model, product=annotation, representation=representation
+                model, product=proxy, representation=representation
             )
             ifcopenshell.api.spatial.assign_container(
-                model, products=[annotation], relating_structure=storey
+                model, products=[proxy], relating_structure=storey
             )
+
+            # Assign the actual solid representation items to the original CAD layer.
             ifcopenshell.api.layer.assign_layer(
-                model, items=[representation], layer=presentation_layer
+                model, items=solids, layer=presentation_layer
             )
 
             pset = ifcopenshell.api.pset.add_pset(
-                model, product=annotation, name="Pset_CADImport"
+                model, product=proxy, name="Pset_CADImport"
             )
             ifcopenshell.api.pset.edit_pset(
                 model,
@@ -386,20 +598,36 @@ def write_ifc(
                 properties={
                     "SourceFile": source.name,
                     "CADLayer": layer_name,
-                    "CurveCount": len(ifc_curves),
+                    "SourceCurveCount": len(curve_chunk),
+                    "SolidSegmentCount": len(solids),
+                    "LineWidthMillimetres": line_width_mm,
+                    "LineHeightMillimetres": line_height_mm,
+                    "BaseElevation": 0.0,
                     "CoordinateScaleToMetres": scale_to_m,
                     "SourceOriginX": origin[0],
                     "SourceOriginY": origin[1],
-                    "SourceOriginZ": origin[2],
+                    "SourceOriginZIgnored": origin[2],
                 },
             )
 
-            annotation_count += 1
-            curve_count += len(ifc_curves)
+            proxy_count += 1
+            solid_count += len(solids)
+
+    validated_proxies, validated_solids = validate_model(
+        model, expected_height_m=height_m
+    )
+    if validated_proxies != proxy_count or validated_solids != solid_count:
+        raise RuntimeError("Internal validation counts do not match generated objects.")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     model.write(str(output))
-    return annotation_count, curve_count
+
+    # Reopen the serialized file to ensure the final STEP file contains no annotations
+    # and all solid base placements still have Z=0.
+    reopened = ifcopenshell.open(str(output))
+    validate_model(reopened, expected_height_m=height_m)
+
+    return proxy_count, solid_count, skipped_zero_length
 
 
 def main() -> int:
@@ -413,6 +641,10 @@ def main() -> int:
         raise ValueError("--tolerance must be greater than zero")
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be greater than zero")
+    if args.line_width_mm <= 0:
+        raise ValueError("--line-width-mm must be greater than zero")
+    if args.line_height_mm <= 0:
+        raise ValueError("--line-height-mm must be greater than zero")
 
     input_path = args.input.resolve()
     output_path = args.output.resolve()
@@ -432,28 +664,41 @@ def main() -> int:
             "No supported line geometry was found in modelspace after filtering."
         )
 
-    annotations, curves = write_ifc(
+    proxies, solids, skipped_zero_length = write_ifc(
         output=output_path,
         source=input_path,
         by_layer=linework,
         scale_to_m=scale_to_m,
         origin=origin,
         chunk_size=args.chunk_size,
+        line_width_mm=args.line_width_mm,
+        line_height_mm=args.line_height_mm,
     )
 
     LOG.info("IFC written: %s", output_path)
     LOG.info(
-        "Layers=%d, curves=%d, vertices=%d, IFC annotations=%d",
+        "Layers=%d, source curves=%d, solid segments=%d, "
+        "IfcBuildingElementProxy=%d, IfcAnnotation=0",
         len(linework),
-        curves,
-        stats.get("vertices", 0),
-        annotations,
+        stats.get("curves", 0),
+        solids,
+        proxies,
     )
+    LOG.info(
+        "All solids: base Z=0, top Z=%.6f m, width=%.3f mm",
+        args.line_height_mm / 1000.0,
+        args.line_width_mm,
+    )
+
+    if skipped_zero_length:
+        LOG.info("Skipped zero-length segments: %d", skipped_zero_length)
+
     skipped = sum(
         count for key, count in stats.items() if key.startswith("skipped_")
     )
     if skipped:
         LOG.info("Skipped unsupported/invalid entities: %d", skipped)
+
     return 0
 
 
