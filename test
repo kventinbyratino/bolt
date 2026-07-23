@@ -1,4 +1,4 @@
-#3!/usr/bin/env python3
+#4!/usr/bin/env python3
 """Convert linework from DWG/DXF into IFC4 curve geometry.
 
 Supported CAD geometry:
