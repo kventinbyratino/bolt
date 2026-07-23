@@ -1,4 +1,4 @@
-#!5/usr/bin/env python3
+#!6/usr/bin/env python3
 """Convert DXF linework into thin 3D IFC solids.
 
 Output geometry:
